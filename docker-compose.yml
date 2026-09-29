@@ -1,0 +1,141 @@
+version: '3.8'
+
+networks:
+  whatsapp_auto_net:
+    driver: bridge
+
+volumes:
+  whatsapp_auto_pgdata:
+  whatsapp_auto_redisdata:
+
+services:
+  postgres:
+    container_name: whatsapp-auto-postgres
+    image: pgvector/pgvector:pg16
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-whatsapp_automation}
+      POSTGRES_USER: ${POSTGRES_USER:-ws_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ws_secure_pass_2026}
+    ports:
+      - "5433:5432"
+    volumes:
+      - whatsapp_auto_pgdata:/var/lib/postgresql/data
+      - ./services/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - whatsapp_auto_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ws_admin} -d ${POSTGRES_DB:-whatsapp_automation}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    container_name: whatsapp-auto-redis
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --save 60 1 --loglevel notice
+    ports:
+      - "6380:6379"
+    volumes:
+      - whatsapp_auto_redisdata:/data
+    networks:
+      - whatsapp_auto_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  db-migrator:
+    container_name: whatsapp-auto-db-migrator
+    build:
+      context: ./services/database
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - whatsapp_auto_net
+
+  backend-api:
+    container_name: whatsapp-auto-backend
+    build:
+      context: ./services/backend-api
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      PORT: 3002
+      DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-super_secret_jwt_key_websavvy_2026}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-849336740073-3fgcpie9lulijeav6vlbivkdlp6jl3g5.apps.googleusercontent.com}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-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}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://ai.websavvy-solutions.com/api/integrations/google/callback}
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - whatsapp_auto_net
+
+  whatsapp-gateway:
+    container_name: whatsapp-auto-gateway
+    build:
+      context: ./services/whatsapp-gateway
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
+      REDIS_URL: redis://redis:6379
+      BACKEND_API_URL: http://backend-api:3002
+    ports:
+      - "3003:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - whatsapp_auto_net
+
+  ai-engine:
+    container_name: whatsapp-auto-ai-engine
+    build:
+      context: ./services/ai-engine
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
+      REDIS_URL: redis://redis:6379
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-849336740073-3fgcpie9lulijeav6vlbivkdlp6jl3g5.apps.googleusercontent.com}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-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}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://ai.websavvy-solutions.com/api/integrations/google/callback}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - whatsapp_auto_net
+
+  pwa:
+    container_name: whatsapp-auto-pwa
+    build:
+      context: ./apps/pwa
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "5174:80"
+    networks:
+      - whatsapp_auto_net
