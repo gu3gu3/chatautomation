@@ -200,36 +200,55 @@ async function startTenantSession(tenantId) {
     for (const msg of messages) {
       if (msg.key.fromMe) continue; // Ignorar mensajes propios
 
-      const remoteJid = msg.key.remoteJid || '';
+      const rawJid = msg.key.remoteJid || '';
       const participant = msg.key.participant || '';
 
+      // Si Baileys proporciona remoteJidAlt en formato @s.whatsapp.net, usarlo preferentemente
+      const targetJid = (msg.key.remoteJidAlt && msg.key.remoteJidAlt.endsWith('@s.whatsapp.net'))
+        ? msg.key.remoteJidAlt
+        : rawJid;
+
       // 1. FILTRADO ABSOLUTO DE GRUPOS, DIFUSIONES, CANALES Y ESTADOS DE WHATSAPP:
-      // Cualquier mensaje proveniente de @g.us, @broadcast, @newsletter, status@broadcast o con campo participant SE DESCARTA DE INMEDIATO EN GATEWAY.
       const isGroupOrBroadcast = 
-        remoteJid.includes('@g.us') || 
-        remoteJid.includes('@broadcast') || 
-        remoteJid.includes('@newsletter') || 
-        remoteJid === 'status@broadcast' || 
+        targetJid.includes('@g.us') || 
+        targetJid.includes('@broadcast') || 
+        targetJid.includes('@newsletter') || 
+        targetJid === 'status@broadcast' || 
         Boolean(participant) ||
         Boolean(msg.isGroup);
 
       if (isGroupOrBroadcast) {
-        logger.info({ tenantId, remoteJid, participant }, '⛔ GRUPO/DIFUSIÓN INTERCEPTADO Y DESCARTADO EN GATEWAY: No se encola ni procesa por el AI Engine.');
-        continue; // NUNCA se procesa ni responde a mensajes de grupos
-      }
-
-      // 2. SOLO PERMITIR CHATS INDIVIDUALES DIRECTOS DE USUARIOS (@s.whatsapp.net o @lid)
-      const isIndividualUser = remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid');
-      if (!isIndividualUser) {
-        logger.info({ tenantId, remoteJid }, '⛔ CHAT NO INDIVIDUAL DESCARTADO EN GATEWAY');
+        logger.info({ tenantId, remoteJid: targetJid, participant }, '⛔ GRUPO/DIFUSIÓN INTERCEPTADO Y DESCARTADO EN GATEWAY: No se encola ni procesa por el AI Engine.');
         continue;
       }
 
-      let text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+      // 2. SOLO PERMITIR CHATS INDIVIDUALES DIRECTOS DE USUARIOS (@s.whatsapp.net o @lid)
+      const isIndividualUser = targetJid.endsWith('@s.whatsapp.net') || targetJid.endsWith('@lid');
+      if (!isIndividualUser) {
+        logger.info({ tenantId, remoteJid: targetJid }, '⛔ CHAT NO INDIVIDUAL DESCARTADO EN GATEWAY');
+        continue;
+      }
+
+      const rawMsg = msg.message?.ephemeralMessage?.message || 
+                     msg.message?.viewOnceMessage?.message || 
+                     msg.message?.viewOnceMessageV2?.message || 
+                     msg.message || {};
+
+      let text = rawMsg.conversation || 
+                 rawMsg.extendedTextMessage?.text || 
+                 rawMsg.imageMessage?.caption || 
+                 rawMsg.videoMessage?.caption || 
+                 rawMsg.documentMessage?.caption || 
+                 rawMsg.buttonsResponseMessage?.selectedButtonId || 
+                 rawMsg.templateButtonReplyMessage?.selectedId || 
+                 rawMsg.listResponseMessage?.singleSelectReply?.selectedRowId || 
+                 '';
+
       let mediaBase64 = null;
       let mediaMimeType = null;
 
-      if (msg.message?.imageMessage) {
+      const imageMsg = rawMsg.imageMessage || msg.message?.imageMessage;
+      if (imageMsg) {
         try {
           const rawBuffer = await downloadMediaMessage(msg, 'buffer', {});
           if (rawBuffer) {
@@ -245,13 +264,13 @@ async function startTenantSession(tenantId) {
         }
       }
 
-      if (remoteJid && (text || mediaBase64)) {
-        logger.info({ tenantId, remoteJid, text, hasImage: !!mediaBase64 }, 'Nuevo mensaje entrante de chat individual recibido en Gateway');
+      if (targetJid && (text || mediaBase64)) {
+        logger.info({ tenantId, remoteJid: targetJid, rawJid, text, hasImage: !!mediaBase64 }, 'Nuevo mensaje entrante de chat individual recibido en Gateway');
 
         // Publicar en la cola de Redis para que el AI Engine lo procese
         const payload = {
           tenantId,
-          senderJid: remoteJid,
+          senderJid: targetJid,
           messageId: msg.key.id,
           text,
           mediaBase64,
@@ -328,10 +347,27 @@ app.post('/api/relay/webhook', async (req, res) => {
       const isIndividualUser = rJid.endsWith('@s.whatsapp.net') || rJid.endsWith('@lid');
       if (!isIndividualUser) continue;
 
-      let msgText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
-      
+      const rawMsg = msg.message?.ephemeralMessage?.message || 
+                     msg.message?.viewOnceMessage?.message || 
+                     msg.message?.viewOnceMessageV2?.message || 
+                     msg.message || {};
+
+      let msgText = rawMsg.conversation || 
+                    rawMsg.extendedTextMessage?.text || 
+                    rawMsg.imageMessage?.caption || 
+                    rawMsg.videoMessage?.caption || 
+                    rawMsg.documentMessage?.caption || 
+                    rawMsg.buttonsResponseMessage?.selectedButtonId || 
+                    rawMsg.templateButtonReplyMessage?.selectedId || 
+                    rawMsg.listResponseMessage?.singleSelectReply?.selectedRowId || 
+                    '';
+
+      if (!msgText && (rawMsg.imageMessage || msg.message?.imageMessage)) {
+        msgText = '[El cliente envió una imagen del producto]';
+      }
+
       if (rJid && msgText) {
-        logger.info({ tenantId, remoteJid: rJid, text: msgText }, 'Nuevo mensaje de Relay encolado en Gateway');
+        logger.info({ tenantId, remoteJid: rJid, text: msgText }, '📲 Mensaje de Relay encolado exitosamente en Gateway');
 
         const payload = {
           tenantId,
@@ -345,6 +381,8 @@ app.post('/api/relay/webhook', async (req, res) => {
 
         await redis.rpush('whatsapp:incoming:queue', JSON.stringify(payload));
         processedCount++;
+      } else {
+        logger.warn({ tenantId, remoteJid: rJid, rawMsgKeys: Object.keys(rawMsg) }, '⚠️ Mensaje de Relay omitido por falta de contenido de texto reconocido');
       }
     }
     return res.json({ success: true, queued: processedCount });
