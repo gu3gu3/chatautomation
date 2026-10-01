@@ -448,6 +448,10 @@ app.get('/api/relay/pending/:tenantId', async (req, res) => {
   }
 });
 
+// Soporte de alias para /api/gateway/relay en el proxy Nginx/Gateway
+app.post('/api/gateway/relay/webhook', (req, res) => app.handle({ ...req, url: '/api/relay/webhook' }, res));
+app.get('/api/gateway/relay/pending/:tenantId', (req, res) => app.handle({ ...req, url: `/api/relay/pending/${req.params.tenantId}` }, res));
+
 // Endpoint para verificar estado en tiempo real del socket/sesión de WhatsApp
 app.get('/api/gateway/status/:tenantId', async (req, res) => {
   const { tenantId } = req.params;
