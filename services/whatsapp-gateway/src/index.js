@@ -12,19 +12,57 @@ import makeWASocket, {
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import sharp from 'sharp';
 import {
   redis,
   msgRetryCounterCache,
   cacheSentMessage,
   getCachedSentMessage,
   updateSessionStatus,
-  getSessionStatus
+  getSessionStatus,
+  getTenantAdminInfo,
+  getTenantConnectionMode
 } from './sessionStore.js';
+import { sendDisconnectionEmail } from './mailer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const logger = pino({ name: 'whatsapp-gateway' });
+
+/**
+ * Optimiza efímeramente en RAM una imagen recibida (máx 800x800px, JPEG calidad 75%)
+ * para reducir drásticamente uso de RAM en Redis, velocidad de red y tokens de visión en Gemini.
+ */
+async function optimizeImageBuffer(rawBuffer) {
+  if (!rawBuffer || rawBuffer.length === 0) return null;
+  try {
+    const resizedBuffer = await sharp(rawBuffer)
+      .resize({
+        width: 800,
+        height: 800,
+        fit: 'inside',
+        withoutEnlargement: true
+      })
+      .jpeg({ quality: 75, progressive: true })
+      .toBuffer();
+
+    const origKb = Math.round(rawBuffer.length / 1024);
+    const optKb = Math.round(resizedBuffer.length / 1024);
+    logger.info({ origKb: `${origKb}KB`, optKb: `${optKb}KB` }, '⚡ Imagen optimizada efímeramente en RAM con sharp (800x800 JPEG 75%)');
+
+    return {
+      buffer: resizedBuffer,
+      mimeType: 'image/jpeg'
+    };
+  } catch (err) {
+    logger.warn({ err: err.message }, 'No se pudo optimizar la imagen con sharp, usando buffer original como fallback');
+    return {
+      buffer: rawBuffer,
+      mimeType: 'image/jpeg'
+    };
+  }
+}
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -66,6 +104,14 @@ function notifySseClients(tenantId, data) {
 async function startTenantSession(tenantId) {
   if (activeSockets.has(tenantId)) {
     return activeSockets.get(tenantId);
+  }
+
+  const connectionMode = await getTenantConnectionMode(tenantId);
+  if (connectionMode === 'RELAY') {
+    logger.info(`Tenant ${tenantId} configurado en modo RELAY. El Gateway local no iniciará Baileys.`);
+    await updateSessionStatus(tenantId, 'RELAY_MODE');
+    notifySseClients(tenantId, { status: 'RELAY_MODE', message: 'Conexión gestionada desde el dispositivo móvil' });
+    return null;
   }
 
   logger.info(`Iniciando sesión Baileys para Tenant: ${tenantId}`);
@@ -127,6 +173,15 @@ async function startTenantSession(tenantId) {
       } else {
         logger.error(`Sesión del tenant ${tenantId} cerrada permanentemente. Limpiando credenciales.`);
         fs.rmSync(authDir, { recursive: true, force: true });
+
+        // Enviar correo de notificación al administrador
+        getTenantAdminInfo(tenantId).then(info => {
+          if (info && info.adminEmail) {
+            sendDisconnectionEmail(info.adminEmail, tenantId, info.tenantName);
+          } else {
+            logger.warn(`No se encontró info de administrador para el tenant ${tenantId}`);
+          }
+        }).catch(err => logger.error({ err }, 'Error al intentar enviar correo de desconexión'));
       }
     } else if (connection === 'open') {
       const phoneNumber = sock.user ? sock.user.id.split(':')[0] : 'Conectado';
@@ -176,16 +231,17 @@ async function startTenantSession(tenantId) {
 
       if (msg.message?.imageMessage) {
         try {
-          const buffer = await downloadMediaMessage(msg, 'buffer', {});
-          if (buffer) {
-            mediaBase64 = buffer.toString('base64');
-            mediaMimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
+          const rawBuffer = await downloadMediaMessage(msg, 'buffer', {});
+          if (rawBuffer) {
+            const opt = await optimizeImageBuffer(rawBuffer);
+            mediaBase64 = opt.buffer.toString('base64');
+            mediaMimeType = opt.mimeType;
             if (!text) {
               text = '[El cliente envió una imagen del producto]';
             }
           }
         } catch (mediaErr) {
-          logger.error({ err: mediaErr.message }, 'Error descargando imagen de WhatsApp en Gateway');
+          logger.error({ err: mediaErr.message }, 'Error descargando/comprimiendo imagen de WhatsApp en Gateway');
         }
       }
 
@@ -234,6 +290,126 @@ async function autoLoadSavedSessions() {
   }
 }
 
+// Webhook para recibir mensajes entrantes de los clientes Android en modo RELAY
+app.post('/api/relay/webhook', async (req, res) => {
+  const { tenantId, remoteJid, text, messageId, timestamp, mediaBase64, mediaMimeType, event, data } = req.body;
+
+  if (!tenantId) {
+    return res.status(400).json({ error: 'tenantId is required' });
+  }
+
+  // Si llega un evento raw de Baileys desde Android Relay
+  if (event === 'messages.upsert' && data?.messages) {
+    const { messages, type } = data;
+    if (type !== 'notify' && type !== 'append') {
+      return res.json({ success: true, processed: 0 });
+    }
+
+    let processedCount = 0;
+    for (const msg of messages) {
+      if (msg.key?.fromMe) continue;
+
+      const rJid = msg.key?.remoteJid || '';
+      const participant = msg.key?.participant || '';
+
+      const isGroupOrBroadcast = 
+        rJid.includes('@g.us') || 
+        rJid.includes('@broadcast') || 
+        rJid.includes('@newsletter') || 
+        rJid === 'status@broadcast' || 
+        Boolean(participant) ||
+        Boolean(msg.isGroup);
+
+      if (isGroupOrBroadcast) {
+        logger.info({ tenantId, remoteJid: rJid }, '⛔ GRUPO/DIFUSIÓN DESCARTADO EN RELAY WEBHOOK');
+        continue;
+      }
+
+      const isIndividualUser = rJid.endsWith('@s.whatsapp.net') || rJid.endsWith('@lid');
+      if (!isIndividualUser) continue;
+
+      let msgText = msg.message?.conversation || msg.message?.extendedTextMessage?.text || msg.message?.imageMessage?.caption || '';
+      
+      if (rJid && msgText) {
+        logger.info({ tenantId, remoteJid: rJid, text: msgText }, 'Nuevo mensaje de Relay encolado en Gateway');
+
+        const payload = {
+          tenantId,
+          senderJid: rJid,
+          messageId: msg.key?.id || `relay-${Date.now()}`,
+          text: msgText,
+          mediaBase64: null,
+          mediaMimeType: null,
+          timestamp: new Date().toISOString()
+        };
+
+        await redis.rpush('whatsapp:incoming:queue', JSON.stringify(payload));
+        processedCount++;
+      }
+    }
+    return res.json({ success: true, queued: processedCount });
+  }
+
+  // Si llega un mensaje individual ya estructurado
+  if (!remoteJid) {
+    return res.status(400).json({ error: 'remoteJid is required for single message payloads' });
+  }
+
+  logger.info({ tenantId, remoteJid, hasImage: !!mediaBase64 }, 'Nuevo mensaje entrante recibido vía Webhook (Android Relay)');
+
+  let processedMediaBase64 = mediaBase64 || null;
+  let processedMediaMimeType = mediaMimeType || null;
+
+  if (mediaBase64 && (mediaMimeType?.startsWith('image/') || !mediaMimeType)) {
+    try {
+      const rawBuffer = Buffer.from(mediaBase64, 'base64');
+      const opt = await optimizeImageBuffer(rawBuffer);
+      if (opt) {
+        processedMediaBase64 = opt.buffer.toString('base64');
+        processedMediaMimeType = opt.mimeType;
+      }
+    } catch (e) {}
+  }
+
+  const payload = {
+    tenantId,
+    senderJid: remoteJid,
+    messageId: messageId || `relay-${Date.now()}`,
+    text: text || '',
+    mediaBase64: processedMediaBase64,
+    mediaMimeType: processedMediaMimeType,
+    timestamp: timestamp || new Date().toISOString()
+  };
+
+  try {
+    await redis.rpush('whatsapp:incoming:queue', JSON.stringify(payload));
+    res.json({ success: true, queued: true });
+  } catch (err) {
+    logger.error({ err, tenantId }, 'Error encolando mensaje del webhook relay');
+    res.status(500).json({ error: 'Failed to queue message' });
+  }
+});
+
+// Endpoint para que la app Android Relay consulte y obtenga mensajes salientes pendientes
+app.get('/api/relay/pending/:tenantId', async (req, res) => {
+  const { tenantId } = req.params;
+  try {
+    const messages = [];
+    // Descolar hasta 10 mensajes pendientes en este ciclo
+    for (let i = 0; i < 10; i++) {
+      const raw = await redis.lpop(`relay:outbound:${tenantId}`);
+      if (!raw) break;
+      try {
+        messages.push(JSON.parse(raw));
+      } catch (e) {}
+    }
+    res.json({ tenantId, count: messages.length, messages });
+  } catch (err) {
+    logger.error({ err, tenantId }, 'Error consultando mensajes salientes pendientes para relay');
+    res.status(500).json({ error: 'Failed to fetch pending messages' });
+  }
+});
+
 // Endpoint para verificar estado en tiempo real del socket/sesión de WhatsApp
 app.get('/api/gateway/status/:tenantId', async (req, res) => {
   const { tenantId } = req.params;
@@ -241,6 +417,8 @@ app.get('/api/gateway/status/:tenantId', async (req, res) => {
   const isSocketActive = !!(sock && sock.user);
 
   const dbStatus = await getSessionStatus(tenantId);
+  const connectionMode = await getTenantConnectionMode(tenantId);
+  
   const connected = isSocketActive || (dbStatus?.status === 'CONNECTED');
   const phoneNumber = sock?.user?.id ? sock.user.id.split(':')[0] : (dbStatus?.phone_number || null);
 
@@ -250,8 +428,36 @@ app.get('/api/gateway/status/:tenantId', async (req, res) => {
     status: connected ? 'CONNECTED' : (dbStatus?.status || 'DISCONNECTED'),
     phoneNumber,
     socketActive: isSocketActive,
-    lastConnectedAt: dbStatus?.last_connected_at || null
+    lastConnectedAt: dbStatus?.last_connected_at || null,
+    connectionMode
   });
+});
+
+// Endpoint para desvincular manualmente WhatsApp de un tenant
+app.post('/api/gateway/disconnect/:tenantId', async (req, res) => {
+  const { tenantId } = req.params;
+  logger.info(`Llegó petición de desconexión para: ${tenantId}`);
+  const sock = activeSockets.get(tenantId);
+  
+  try {
+    if (sock) {
+      await sock.logout(); // Esto forzará un DisconnectReason.loggedOut
+      activeSockets.delete(tenantId);
+    } else {
+      // Si el socket no está activo, simplemente limpiamos las credenciales
+      const authDir = getTenantAuthDir(tenantId);
+      if (fs.existsSync(authDir)) {
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+      await updateSessionStatus(tenantId, 'DISCONNECTED');
+      notifySseClients(tenantId, { status: 'DISCONNECTED' });
+    }
+    logger.info(`Desvinculación manual ejecutada para tenant ${tenantId}`);
+    res.json({ status: 'success', message: 'WhatsApp desvinculado correctamente' });
+  } catch (error) {
+    logger.error({ error, tenantId }, 'Error al desvincular WhatsApp manualmente');
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Endpoint SSE para streaming de QR al Frontend PWA
@@ -303,7 +509,22 @@ app.post('/api/gateway/send-message', async (req, res) => {
   }
 
   const sock = activeSockets.get(tenantId);
+  const connectionMode = await getTenantConnectionMode(tenantId);
+
   if (!sock) {
+    if (connectionMode === 'RELAY') {
+      logger.info({ tenantId, toJid }, 'Encolando mensaje saliente para despacho por Android Relay App...');
+      const outboundMsg = {
+        toJid,
+        text,
+        mediaBase64,
+        mediaMimeType,
+        fileName,
+        timestamp: new Date().toISOString()
+      };
+      await redis.rpush(`relay:outbound:${tenantId}`, JSON.stringify(outboundMsg));
+      return res.json({ status: 'queued_for_relay', success: true, messageId: `relay-out-${Date.now()}` });
+    }
     return res.status(503).json({ error: `La sesión de WhatsApp para el tenant ${tenantId} no está activa` });
   }
 

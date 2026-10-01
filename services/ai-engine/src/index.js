@@ -15,7 +15,7 @@ const pool = new Pool({
 });
 
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6380');
-const GATEWAY_URL = process.env.GATEWAY_URL || 'http://whatsapp-gateway:3001';
+const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:3001';
 
 const apiKey = process.env.GEMINI_API_KEY;
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;

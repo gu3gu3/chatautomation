@@ -33,3 +33,11 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+
+# Android APK & Relay App Development
+apps/android-relay/
+.gradle/
+*.apk
+*.aab
+node_logs.txt
+

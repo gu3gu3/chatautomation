@@ -206,4 +206,37 @@ router.post('/impersonate-log', authenticateToken, requireRole('SUPERADMIN_MSP')
   }
 });
 
+// PUT /api/tenants/:id/connection-mode - Actualizar el modo de conexión del tenant
+router.put('/:id/connection-mode', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { mode } = req.body;
+  
+  // Validar permisos: Solo el admin del tenant o Superadmin MSP
+  const isSuperAdmin = req.user.role === 'SUPERADMIN_MSP';
+  const isTenantOwner = req.user.tenant_id === id && req.user.role === 'TENANT_OWNER';
+  
+  if (!isSuperAdmin && !isTenantOwner) {
+    return res.status(403).json({ error: 'Acceso denegado' });
+  }
+
+  if (!['CENTRALIZED', 'RELAY'].includes(mode)) {
+    return res.status(400).json({ error: 'Modo de conexión inválido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE tenants SET connection_mode = $1 WHERE id = $2 RETURNING id, connection_mode`,
+      [mode, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Tenant no encontrado' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;

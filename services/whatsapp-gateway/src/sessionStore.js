@@ -76,3 +76,46 @@ export async function getSessionStatus(tenantId) {
   }
   return null;
 }
+
+/**
+ * Obtiene el correo del administrador y nombre de un tenant desde PostgreSQL
+ */
+export async function getTenantAdminInfo(tenantId) {
+  try {
+    const res = await pool.query(
+      `SELECT u.email as admin_email, t.name as tenant_name 
+       FROM users u 
+       JOIN tenants t ON t.id = u.tenant_id 
+       WHERE u.tenant_id = $1 AND u.role = 'TENANT_OWNER' 
+       LIMIT 1`,
+      [tenantId]
+    );
+    if (res.rows.length > 0) {
+      return {
+        adminEmail: res.rows[0].admin_email,
+        tenantName: res.rows[0].tenant_name
+      };
+    }
+  } catch (err) {
+    logger.error({ err }, 'Error obteniendo admin_email y nombre del tenant en Postgres');
+  }
+  return null;
+}
+
+/**
+ * Obtiene el modo de conexión del tenant ('CENTRALIZED' o 'RELAY')
+ */
+export async function getTenantConnectionMode(tenantId) {
+  try {
+    const res = await pool.query(
+      `SELECT connection_mode FROM tenants WHERE id = $1 LIMIT 1`,
+      [tenantId]
+    );
+    if (res.rows.length > 0) {
+      return res.rows[0].connection_mode || 'CENTRALIZED';
+    }
+  } catch (err) {
+    logger.error({ err }, 'Error obteniendo connection_mode del tenant en Postgres');
+  }
+  return 'CENTRALIZED'; // Default fallback
+}

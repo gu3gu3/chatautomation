@@ -318,6 +318,8 @@ export default function App() {
   const [qrStatus, setQrStatus] = useState('DISCONNECTED');
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [connectedPhone, setConnectedPhone] = useState('50588713689');
+  const [connectionMode, setConnectionMode] = useState('CENTRALIZED');
+  const [isChangingMode, setIsChangingMode] = useState(false);
 
   // Estado de Prompts & Wizard
   const [promptTitle, setPromptTitle] = useState('Agente Principal');
@@ -441,6 +443,7 @@ export default function App() {
   const [calHasCreds, setCalHasCreds] = useState(false);
   const [isSavingCal, setIsSavingCal] = useState(false);
   const [isTestingCal, setIsTestingCal] = useState(false);
+  const [isDisconnecting, setIsDisconnecting] = useState(false);
 
   // Estado del Módulo de Logística (Distribuidores, Repartidores y Pedidos)
   const [logisticsSummary, setLogisticsSummary] = useState({
@@ -523,6 +526,10 @@ export default function App() {
         if (data.status === 'CONNECTED') {
           setQrStatus('CONNECTED');
           setConnectedPhone(data.phoneNumber || 'Conectado');
+          setQrDataUrl('');
+        } else if (data.status === 'RELAY_MODE') {
+          setQrStatus('RELAY_MODE');
+          if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
           setQrDataUrl('');
         } else if (data.status === 'QR_READY') {
           setQrStatus('QR_READY');
@@ -827,6 +834,26 @@ export default function App() {
   };
 
   // Iniciar flujo OAuth2 "Conectar con Google"
+  const handleDisconnectWhatsApp = async () => {
+    if (!window.confirm('¿Está seguro de que desea desvincular el dispositivo de WhatsApp actual para este tenant?')) return;
+    
+    setIsDisconnecting(true);
+    try {
+      const res = await fetch(`${GATEWAY_BASE}/api/gateway/disconnect/${user.effectiveTenantId || user.tenant_id}`, { method: 'POST' });
+      if (res.ok) {
+        setQrStatus('DISCONNECTED');
+        setConnectedPhone('');
+        setQrDataUrl('');
+      } else {
+        alert('Hubo un error al desvincular WhatsApp.');
+      }
+    } catch (err) {
+      alert('Error de red al desvincular WhatsApp.');
+    } finally {
+      setIsDisconnecting(false);
+    }
+  };
+
   const handleConnectGoogle = async () => {
     if (!token) return;
     try {
@@ -939,7 +966,12 @@ export default function App() {
       if (data.success) {
         alert(`✅ ${data.message}`);
       } else {
-        alert(`❌ Error en prueba de Google Sheets: ${data.error}`);
+        const errMsg = data.error || '';
+        if (errMsg.includes('invalid_grant') || errMsg.includes('expiró') || errMsg.includes('revocada')) {
+          alert(`⚠️ La sesión de Google OAuth ha expirado o fue revocada por Google (los tokens de prueba expiran a los 7 días).\n\nPor favor haz clic arriba en el botón "Reconectar / Cambiar Cuenta de Google" para renovar los permisos de acceso.`);
+        } else {
+          alert(`❌ Error en prueba de Google Sheets: ${errMsg}`);
+        }
       }
     } catch (e) {
       alert('Error probando conexión con Google Sheets');
@@ -966,7 +998,12 @@ export default function App() {
       if (data.success) {
         alert(`✅ ${data.message}`);
       } else {
-        alert(`❌ Error en sincronización: ${data.error}`);
+        const errMsg = data.error || '';
+        if (errMsg.includes('invalid_grant') || errMsg.includes('expiró') || errMsg.includes('revocada')) {
+          alert(`⚠️ La sesión de Google OAuth ha expirado o fue revocada por Google (los tokens de prueba expiran a los 7 días).\n\nPor favor haz clic arriba en el botón "Reconectar / Cambiar Cuenta de Google" para renovar el acceso.`);
+        } else {
+          alert(`❌ Error en sincronización: ${errMsg}`);
+        }
       }
     } catch (e) {
       alert('Error de conexión al sincronizar la hoja con la base de datos de vectores');
@@ -1230,6 +1267,32 @@ export default function App() {
     }
   };
 
+  // Alternar Connection Mode de Tenant (Superadmin MSP CRUD)
+  const handleUpdateTenantConnectionModeMSP = async (tenantId, mode) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/tenants/${tenantId}/connection-mode`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ mode })
+      });
+
+      if (res.ok) {
+        fetchTenants();
+        if (user.effectiveTenantId === tenantId || user.tenant_id === tenantId) {
+          setConnectionMode(mode);
+        }
+      } else {
+        const err = await res.json();
+        alert(`Error al actualizar connection mode: ${err.error}`);
+      }
+    } catch (e) {
+      alert('Error de red al actualizar connection mode');
+    }
+  };
+
   // Resetear Contraseña de Tenant (Generar Clave Temporal para el Cliente - MSP)
   const handleResetTenantPasswordMSP = async (t) => {
     if (!confirm(`¿Deseas generar una contraseña temporal de acceso para la empresa "${t.name}"?`)) return;
@@ -1276,8 +1339,14 @@ export default function App() {
       const res = await fetch(`${GATEWAY_BASE}/api/gateway/status/${tId}`);
       if (res.ok) {
         const data = await res.json();
+        if (data.connectionMode) setConnectionMode(data.connectionMode);
+        
         if (data.connected) {
           setQrStatus('CONNECTED');
+          if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
+          setQrDataUrl('');
+        } else if (data.status === 'RELAY_MODE' || data.connectionMode === 'RELAY') {
+          setQrStatus('RELAY_MODE');
           if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
           setQrDataUrl('');
         } else {
@@ -1285,6 +1354,33 @@ export default function App() {
         }
       }
     } catch (e) {}
+  };
+
+  const handleUpdateConnectionMode = async (mode) => {
+    if (!token) return;
+    setIsChangingMode(true);
+    const tenantId = user.effectiveTenantId || user.tenant_id;
+    try {
+      const res = await fetch(`${API_BASE}/api/tenants/${tenantId}/connection-mode`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ mode })
+      });
+      if (res.ok) {
+        setConnectionMode(mode);
+        alert(`Modo de conexión actualizado a: ${mode === 'CENTRALIZED' ? 'Servidor (Rápido)' : 'Dispositivo Local (Anti-Bloqueo)'}`);
+      } else {
+        const err = await res.json();
+        alert('Error al actualizar el modo: ' + err.error);
+      }
+    } catch (e) {
+      alert('Error de conexión al actualizar el modo.');
+    } finally {
+      setIsChangingMode(false);
+    }
   };
 
   // Crear/Actualizar Plan en MSP Maestro
@@ -2130,7 +2226,7 @@ export default function App() {
           <div className="grid-2">
             <div className="card">
               <div className="card-title">
-                <QrCode /> Vinculación de WhatsApp sin API — {user.tenantName}
+                <QrCode /> Vinculación de WhatsApp — {user.tenantName}
               </div>
               <p style={{ color: 'var(--text-muted)', marginBottom: '20px', fontSize: '0.9rem' }}>
                 Escanea el código QR desde tu celular para vincular el agente de <strong>{user.tenantName}</strong>.
@@ -2142,6 +2238,23 @@ export default function App() {
                     <CheckCircle2 size={52} color="var(--primary-green)" style={{ margin: '0 auto 12px' }} />
                     <h3 style={{ color: 'var(--primary-green)', marginBottom: '4px' }}>¡WhatsApp Conectado!</h3>
                     <p style={{ fontSize: '0.95rem', color: 'var(--text-main)', marginTop: '6px' }}>Número: <strong>+{connectedPhone}</strong></p>
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={handleDisconnectWhatsApp} 
+                      disabled={isDisconnecting}
+                      style={{ marginTop: '16px', border: '1px solid #EF4444', color: '#EF4444', background: 'rgba(239, 68, 68, 0.1)', fontWeight: 'bold' }}
+                    >
+                      {isDisconnecting ? 'Desvinculando...' : 'Desvincular Dispositivo'}
+                    </button>
+                  </div>
+                ) : qrStatus === 'RELAY_MODE' ? (
+                  <div style={{ background: 'rgba(34, 197, 94, 0.12)', border: '1px solid var(--primary-green)', padding: '24px', borderRadius: '14px' }}>
+                    <Smartphone size={52} color="var(--primary-green)" style={{ margin: '0 auto 12px' }} />
+                    <h3 style={{ color: 'var(--primary-green)', marginBottom: '6px' }}>¡Vinculación Exitosa en Teléfono del Cliente!</h3>
+                    <p style={{ fontSize: '0.95rem', color: 'var(--text-main)', marginTop: '4px' }}>
+                      Modo Relay Móvil Activo (Gestionado directamente desde la aplicación móvil Android).
+                    </p>
+                    {connectedPhone && <p style={{ fontSize: '0.95rem', color: 'var(--text-main)', marginTop: '6px' }}>Número: <strong>+{connectedPhone}</strong></p>}
                   </div>
                 ) : qrDataUrl ? (
                   <div style={{ background: '#FFFFFF', padding: '16px', borderRadius: '14px', display: 'inline-block' }}>
@@ -2152,7 +2265,6 @@ export default function App() {
                     <RefreshCw size={32} className="spin" style={{ margin: '0 auto 12px', display: 'block' }} />
                     Verificando estado de conexión con WhatsApp...
                   </div>
-
                 )}
               </div>
             </div>
@@ -3134,11 +3246,12 @@ REGLAS DE AGENDAMIENTO Y HERRAMIENTAS:
                 <thead>
                   <tr style={{ borderBottom: '1px solid var(--border-color)', textAlign: 'left', color: 'var(--text-muted)' }}>
                     <th style={{ padding: '12px' }}>ID Tenant</th>
-                    <th style={{ padding: '12px' }}>Empresa / Organización</th>
-                    <th style={{ padding: '12px' }}>Correo Electrónico (Admin)</th>
-                    <th style={{ padding: '12px' }}>Plan de Suscripción (CRUD)</th>
-                    <th style={{ padding: '12px' }}>Modo Demo (Prueba)</th>
-                    <th style={{ padding: '12px' }}>Estado WhatsApp</th>
+                    <th style={{ padding: '12px' }}>Empresa</th>
+                    <th style={{ padding: '12px' }}>Correo Admin</th>
+                    <th style={{ padding: '12px' }}>Suscripcion</th>
+                    <th style={{ padding: '12px' }}>Modo</th>
+                    <th style={{ padding: '12px' }}>Relay</th>
+                    <th style={{ padding: '12px' }}>Estado GW</th>
                     <th style={{ padding: '12px' }}>Acción MSP</th>
                   </tr>
                 </thead>
@@ -3202,8 +3315,34 @@ REGLAS DE AGENDAMIENTO Y HERRAMIENTAS:
                         </button>
                       </td>
                       <td style={{ padding: '12px' }}>
-                        <span style={{ color: t.whatsapp_status === 'CONNECTED' ? '#22C55E' : '#EF4444', fontWeight: 'bold' }}>
-                          {t.whatsapp_status === 'CONNECTED' ? '🟢 Conectado' : '🔴 Desconectado'}
+                        <button 
+                          onClick={() => handleUpdateTenantConnectionModeMSP(t.id, t.connection_mode === 'RELAY' ? 'CENTRALIZED' : 'RELAY')}
+                          style={{
+                            background: t.connection_mode === 'RELAY' ? 'rgba(59,130,246,0.15)' : 'rgba(107,114,128,0.15)',
+                            color: t.connection_mode === 'RELAY' ? '#3B82F6' : '#9CA3AF',
+                            border: `1px solid ${t.connection_mode === 'RELAY' ? 'rgba(59,130,246,0.3)' : 'rgba(107,114,128,0.3)'}`,
+                            padding: '4px 10px',
+                            borderRadius: '20px',
+                            fontSize: '0.8rem',
+                            fontWeight: 'bold',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px'
+                          }}
+                          title="Activar/Desactivar Relay Móvil"
+                        >
+                          {t.connection_mode === 'RELAY' ? '📱 Relay On' : '🖥️ Relay Off'}
+                        </button>
+                      </td>
+                      <td style={{ padding: '12px' }}>
+                        <span style={{ 
+                          color: (t.whatsapp_status === 'CONNECTED' || t.connection_mode === 'RELAY') ? '#22C55E' : '#EF4444', 
+                          fontWeight: 'bold' 
+                        }}>
+                          {t.connection_mode === 'RELAY' 
+                            ? '🟢 Conectado (Relay)' 
+                            : (t.whatsapp_status === 'CONNECTED' ? '🟢 Conectado' : '🔴 Desconectado')}
                         </span>
                       </td>
                       <td style={{ padding: '12px' }}>

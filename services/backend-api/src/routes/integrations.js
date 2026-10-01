@@ -347,6 +347,17 @@ router.post('/drive', authenticateToken, async (req, res) => {
   }
 });
 
+/**
+ * Formatea errores provenientes de Google API para dar mensajes claros al usuario
+ */
+function formatGoogleError(error) {
+  const errStr = String(error?.message || error?.response?.data?.error || error || '');
+  if (errStr.includes('invalid_grant') || errStr.includes('expired or revoked') || error?.response?.data?.error === 'invalid_grant') {
+    return 'La sesión de Google ha expirado o fue revocada. Por favor haz clic en "Reconectar / Cambiar Cuenta de Google" para volver a autorizar.';
+  }
+  return error?.message || 'Error al comunicarse con la API de Google';
+}
+
 // POST /api/integrations/test - Probar conexión con Google Sheets o Calendar
 router.post('/test', authenticateToken, async (req, res) => {
   const tenantId = req.user.effectiveTenantId;
@@ -416,7 +427,9 @@ router.post('/test', authenticateToken, async (req, res) => {
 
     return res.status(400).json({ success: false, error: 'Tipo de integración no soportado' });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    const formattedError = formatGoogleError(error);
+    logger.warn({ error: error.message, tenantId, integration_type }, 'Error probando integración con Google');
+    res.status(400).json({ success: false, error: formattedError });
   }
 });
 
@@ -529,8 +542,9 @@ router.post('/google/sync-sheets-embeddings', authenticateToken, async (req, res
       syncedCount,
     });
   } catch (error) {
-    logger.error({ error }, 'Error en sincronización de Google Sheets a embeddings');
-    res.status(500).json({ success: false, error: error.message });
+    const formattedError = formatGoogleError(error);
+    logger.error({ error: error.message }, 'Error en sincronización de Google Sheets a embeddings');
+    res.status(400).json({ success: false, error: formattedError });
   }
 });
 

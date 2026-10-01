@@ -98,7 +98,12 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
       REDIS_URL: redis://redis:6379
       BACKEND_API_URL: http://backend-api:3002
+      SMTP_HOST: ${SMTP_HOST:-websavvy-solutions.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-notificaciones@websavvy-solutions.com}
+      SMTP_PASS: ${SMTP_PASS:-}
     ports:
+      - "3001:3001"
       - "3003:3001"
     depends_on:
       postgres:
@@ -117,6 +122,7 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-ws_admin}:${POSTGRES_PASSWORD:-ws_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-whatsapp_automation}
       REDIS_URL: redis://redis:6379
+      GATEWAY_URL: http://whatsapp-gateway:3001
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-849336740073-3fgcpie9lulijeav6vlbivkdlp6jl3g5.apps.googleusercontent.com}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-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}
