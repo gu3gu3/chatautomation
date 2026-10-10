@@ -39,56 +39,66 @@ export async function searchAndDownloadDriveFile({ credentials, folderId, fileQu
   const drive = getDriveClient(credentials);
 
   try {
-    const cleanQuery = (fileQuery || '').replace(/'/g, "\\'").trim();
-    
+    // 1. Sanitizar la consulta eliminando extensiones de archivo y caracteres que puedan romper la sintaxis de Google Drive API
+    const rawClean = (fileQuery || '').replace(/\.(png|jpg|jpeg|pdf|webp|docx?|xlsx?)/gi, '').trim();
+    const sanitizedQuery = rawClean.replace(/['"\\]/g, '').trim();
+
     let queryClause = `trashed = false`;
     if (folderId) {
       const cleanFolderId = folderId.trim();
       queryClause += ` and '${cleanFolderId}' in parents`;
     }
-    if (cleanQuery) {
-      queryClause += ` and (name contains '${cleanQuery}' or fullText contains '${cleanQuery}')`;
-    }
 
-    logger.info({ folderId, fileQuery, queryClause }, 'Buscando archivos en Google Drive...');
+    logger.info({ folderId, fileQuery, sanitizedQuery }, 'Buscando archivo en Google Drive (Búsqueda Genérica)...');
 
-    // 1. Buscar archivos en la carpeta de Google Drive
-    const listRes = await drive.files.list({
-      q: queryClause,
+    // Intento 1: Búsqueda por subcadena exacta en el nombre del archivo
+    let searchRes = await drive.files.list({
+      q: `${queryClause} and name contains '${sanitizedQuery}'`,
       fields: 'files(id, name, mimeType, size)',
-      pageSize: 5,
+      pageSize: 10,
+    }).catch(err => {
+      logger.warn({ err: err.message }, 'Advertencia en consulta directa de Google Drive API');
+      return null;
     });
 
-    let files = listRes.data.files || [];
+    let files = searchRes?.data?.files || [];
 
-    // Fallback 1: Si la palabra clave exacta no coincide, intentar buscar por fragmentos de palabras
-    if (files.length === 0 && cleanQuery) {
-      const words = cleanQuery.split(/\s+/).filter(w => w.length > 2);
-      for (const word of words) {
-        const cleanWord = word.replace(/'/g, "\\'");
-        const fallbackQuery = `trashed = false${folderId ? ` and '${folderId}' in parents` : ''} and (name contains '${cleanWord}' or fullText contains '${cleanWord}')`;
-        const fbRes = await drive.files.list({
-          q: fallbackQuery,
-          fields: 'files(id, name, mimeType, size)',
-          pageSize: 5,
-        });
-        if (fbRes.data.files && fbRes.data.files.length > 0) {
-          files = fbRes.data.files;
-          break;
-        }
-      }
-    }
-
-    // Fallback 2: Si aún no se encuentra coincidencia por palabra clave, traer el primer archivo disponible en la carpeta
+    // Intento 2: Si no hay coincidencia exacta del string completo, listar archivos de la carpeta y comparar nombres por coincidencia de palabras
     if (files.length === 0 && folderId) {
-      const folderFallbackQuery = `trashed = false and '${folderId.trim()}' in parents`;
       const folderRes = await drive.files.list({
-        q: folderFallbackQuery,
+        q: queryClause,
         fields: 'files(id, name, mimeType, size)',
-        pageSize: 5,
-      });
-      if (folderRes.data.files && folderRes.data.files.length > 0) {
-        files = folderRes.data.files;
+        pageSize: 50,
+      }).catch(() => null);
+
+      const allFiles = folderRes?.data?.files || [];
+      const queryTokens = sanitizedQuery.toLowerCase().split(/[\s_.-]+/).filter(t => t.length > 1);
+
+      if (allFiles.length > 0 && queryTokens.length > 0) {
+        // Encontrar el archivo cuyo nombre coincida con la mayor cantidad de palabras clave del query
+        let bestMatch = null;
+        let maxScore = 0;
+
+        for (const file of allFiles) {
+          const fileNameLower = file.name.toLowerCase();
+          let score = 0;
+          for (const token of queryTokens) {
+            if (fileNameLower.includes(token)) {
+              score++;
+            }
+          }
+          if (score > maxScore) {
+            maxScore = score;
+            bestMatch = file;
+          }
+        }
+
+        if (bestMatch && maxScore > 0) {
+          files = [bestMatch];
+        } else {
+          logger.warn({ folderId, fileQuery, sanitizedQuery }, 'No se encontraron archivos en Google Drive que coincidan con las palabras clave.');
+          return { success: false, error: `No se encontraron archivos en Google Drive que coincidan con "${fileQuery}"` };
+        }
       }
     }
 
@@ -103,7 +113,7 @@ export async function searchAndDownloadDriveFile({ credentials, folderId, fileQu
     let finalMimeType = targetFile.mimeType;
     let finalFileName = targetFile.name;
 
-    // 2. Descargar o exportar según el tipo de archivo (Soporte para Google Docs/Sheets/Slides a PDF)
+    // 2. Descargar o exportar según el tipo de archivo (Docs/Sheets/Slides a PDF o binario directo)
     if (targetFile.mimeType === 'application/vnd.google-apps.document' || 
         targetFile.mimeType === 'application/vnd.google-apps.spreadsheet' || 
         targetFile.mimeType === 'application/vnd.google-apps.presentation') {

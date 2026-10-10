@@ -483,6 +483,20 @@ async function executeToolCall(call, integrations, tenantId, senderJid) {
     });
 
     if (result.success && result.mediaBase64) {
+      // Prevención de envíos duplicados: verificar si el mismo archivo ya se envió a este JID en los últimos 60s
+      const dedupeKey = `sent_media:${tenantId}:${senderJid}:${result.fileName}`;
+      const alreadySent = await redis.get(dedupeKey);
+      if (alreadySent) {
+        logger.info({ tenantId, senderJid, fileName: result.fileName }, '🛑 Archivo multimedia enviado recientemente. Omitiendo duplicado.');
+        return {
+          success: true,
+          fileName: result.fileName,
+          message: `El archivo ${result.fileName} ya fue enviado previamente al cliente por WhatsApp.`
+        };
+      }
+
+      await redis.setex(dedupeKey, 60, 'true');
+
       const captionText = args.caption || `📎 Te comparto el archivo de ${result.fileName}`;
       const sentOk = await sendWhatsAppMessage(tenantId, senderJid, captionText, {
         mediaBase64: result.mediaBase64,

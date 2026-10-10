@@ -51,7 +51,7 @@ export async function updateSessionStatus(tenantId, status, phoneNumber = null) 
       `INSERT INTO whatsapp_sessions (tenant_id, status, phone_number, last_connected_at, updated_at)
        VALUES ($1, $2, $3, NOW(), NOW())
        ON CONFLICT (tenant_id) 
-       DO UPDATE SET status = $2, phone_number = COALESCE($3, whatsapp_sessions.phone_number), updated_at = NOW()`,
+       DO UPDATE SET status = $2, phone_number = $3, updated_at = NOW()`,
       [tenantId, status, phoneNumber]
     );
   } catch (err) {
@@ -119,3 +119,36 @@ export async function getTenantConnectionMode(tenantId) {
   }
   return 'CENTRALIZED'; // Default fallback
 }
+
+/**
+ * Pausa la respuesta automática de IA para un cliente (Human Takeover) por X segundos (default 30 min / 1800s)
+ */
+export async function pauseAiForTenantJid(tenantId, senderJid, durationSeconds = 1800) {
+  if (!tenantId || !senderJid) return;
+  try {
+    const redisKey = `ai_paused:${tenantId}:${senderJid}`;
+    await redis.set(redisKey, 'true', 'EX', durationSeconds);
+    logger.info({ tenantId, senderJid, durationSeconds }, '⏸️ IA auto-pausada por intervención humana en WhatsApp Web/Móvil');
+  } catch (err) {
+    logger.error({ err }, 'Error pausando la IA en Redis para Human Takeover');
+  }
+}
+
+/**
+ * Registra en message_logs un mensaje enviado manualmente desde WhatsApp Web/Móvil (handled_by_ai = false)
+ */
+export async function logHumanMessage(tenantId, senderJid, messageId, text) {
+  if (!tenantId || !senderJid || !text) return;
+  try {
+    const logId = `msg-manual-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    await pool.query(
+      `INSERT INTO message_logs (id, tenant_id, sender_jid, message_id, incoming_text, outgoing_response, handled_by_ai, created_at)
+       VALUES ($1, $2, $3, $4, NULL, $5, FALSE, NOW())`,
+      [logId, tenantId, senderJid, messageId || logId, text]
+    );
+    logger.info({ tenantId, senderJid, messageId }, '📝 Mensaje manual de WhatsApp Web registrado en message_logs (handled_by_ai = false)');
+  } catch (err) {
+    logger.error({ err }, 'Error registrando mensaje manual en message_logs');
+  }
+}
+

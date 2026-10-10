@@ -21,7 +21,9 @@ import {
   updateSessionStatus,
   getSessionStatus,
   getTenantAdminInfo,
-  getTenantConnectionMode
+  getTenantConnectionMode,
+  pauseAiForTenantJid,
+  logHumanMessage
 } from './sessionStore.js';
 import { sendDisconnectionEmail } from './mailer.js';
 
@@ -109,8 +111,10 @@ async function startTenantSession(tenantId) {
   const connectionMode = await getTenantConnectionMode(tenantId);
   if (connectionMode === 'RELAY') {
     logger.info(`Tenant ${tenantId} configurado en modo RELAY. El Gateway local no iniciará Baileys.`);
-    await updateSessionStatus(tenantId, 'RELAY_MODE');
-    notifySseClients(tenantId, { status: 'RELAY_MODE', message: 'Conexión gestionada desde el dispositivo móvil' });
+    const currentDbStatus = await getSessionStatus(tenantId);
+    if (!currentDbStatus || !currentDbStatus.status) {
+      await updateSessionStatus(tenantId, 'DISCONNECTED');
+    }
     return null;
   }
 
@@ -198,8 +202,6 @@ async function startTenantSession(tenantId) {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (msg.key.fromMe) continue; // Ignorar mensajes propios
-
       const rawJid = msg.key.remoteJid || '';
       const participant = msg.key.participant || '';
 
@@ -243,6 +245,51 @@ async function startTenantSession(tenantId) {
                  rawMsg.templateButtonReplyMessage?.selectedId || 
                  rawMsg.listResponseMessage?.singleSelectReply?.selectedRowId || 
                  '';
+
+      // Captura de Intervención Humana (Mensaje enviado manualmente desde WhatsApp Web / Móvil en tiempo real)
+      if (msg.key.fromMe) {
+        // Verificar antigüedad del mensaje para descartar sincronizaciones de historial al abrir WhatsApp Web
+        const nowSec = Math.floor(Date.now() / 1000);
+        const rawTs = msg.messageTimestamp;
+        const msgSec = typeof rawTs === 'number' ? rawTs : (rawTs?.low || rawTs || nowSec);
+        const ageSeconds = nowSec - msgSec;
+
+        if (ageSeconds > 30) {
+          logger.info({ tenantId, remoteJid: targetJid, ageSeconds }, '📜 Mensaje histórico sincronizado desde WhatsApp Web/Móvil. Omitiendo pausa de IA.');
+          continue;
+        }
+
+        const isBotMessage = await getCachedSentMessage(tenantId, msg.key.id);
+        if (!isBotMessage) {
+          const lowerText = (text || '').toLowerCase();
+          const isAutoGreeting = lowerText.includes('saludo automático') || 
+                                 lowerText.includes('saludo automatico') ||
+                                 lowerText.includes('anuncio de facebook') ||
+                                 lowerText.includes('gracias por consultar');
+
+          if (!isAutoGreeting) {
+            const manualText = text || '[Archivo/Imagen enviado manualmente desde WhatsApp Web/Móvil]';
+            logger.info({ tenantId, remoteJid: targetJid, text: manualText }, '👤 Intervención humana manual en tiempo real detectada en WhatsApp Web/Móvil. Pausando IA por 30 min y registrando contexto.');
+            await pauseAiForTenantJid(tenantId, targetJid, 1800);
+            await logHumanMessage(tenantId, targetJid, msg.key.id, manualText);
+          } else {
+            logger.info({ tenantId, remoteJid: targetJid, text }, '🤖 Saludo automático o anuncio detectado (fromMe). Omitiendo pausa de IA.');
+          }
+        }
+        continue; // No enviar a la cola de AI Engine
+      }
+
+      // Capturar metadatos de anuncios de Facebook / Meta Ads (Click-to-WhatsApp o Get Offer)
+      const contextInfo = rawMsg.extendedTextMessage?.contextInfo || rawMsg.contextInfo || {};
+      const ref = contextInfo.referral || contextInfo.externalAdReply;
+      if (ref) {
+        const headline = ref.headline || ref.title || '';
+        const body = ref.body || ref.snippet || '';
+        const refDetails = [headline, body].filter(Boolean).join(' - ');
+        if (refDetails) {
+          text = text ? `${text}\n[Origen Anuncio Meta/Facebook: ${refDetails}]` : `[Origen Anuncio Meta/Facebook: ${refDetails}]`;
+        }
+      }
 
       let mediaBase64 = null;
       let mediaMimeType = null;
@@ -317,6 +364,21 @@ app.post('/api/relay/webhook', async (req, res) => {
     return res.status(400).json({ error: 'tenantId is required' });
   }
 
+  // Notificación de estado de conexión desde Android Relay App
+  if (event === 'relay.status') {
+    const status = data?.status === 'CONNECTED' ? 'CONNECTED' : 'DISCONNECTED';
+    const phoneNumber = data?.phoneNumber || null;
+    logger.info({ tenantId, status, phoneNumber }, '📡 Actualización de estado recibida desde Android Relay App');
+    await updateSessionStatus(tenantId, status, phoneNumber);
+    if (status === 'CONNECTED') {
+      await redis.set(`relay:last_seen:${tenantId}`, Date.now().toString(), 'EX', 60);
+    } else {
+      await redis.del(`relay:last_seen:${tenantId}`);
+    }
+    notifySseClients(tenantId, { status, phoneNumber, message: status === 'CONNECTED' ? 'Relay conectado' : 'Relay desvinculado' });
+    return res.json({ success: true, status });
+  }
+
   // Si llega un evento raw de Baileys desde Android Relay
   if (event === 'messages.upsert' && data?.messages) {
     const { messages, type } = data;
@@ -326,8 +388,6 @@ app.post('/api/relay/webhook', async (req, res) => {
 
     let processedCount = 0;
     for (const msg of messages) {
-      if (msg.key?.fromMe) continue;
-
       const rJid = msg.key?.remoteJid || '';
       const participant = msg.key?.participant || '';
 
@@ -361,6 +421,38 @@ app.post('/api/relay/webhook', async (req, res) => {
                     rawMsg.templateButtonReplyMessage?.selectedId || 
                     rawMsg.listResponseMessage?.singleSelectReply?.selectedRowId || 
                     '';
+
+      if (msg.key?.fromMe) {
+        const isBotMessage = await getCachedSentMessage(tenantId, msg.key.id);
+        if (!isBotMessage) {
+          const lowerText = (msgText || '').toLowerCase();
+          const isAutoGreeting = lowerText.includes('saludo automático') || 
+                                 lowerText.includes('saludo automatico') ||
+                                 lowerText.includes('anuncio de facebook') ||
+                                 lowerText.includes('gracias por consultar');
+
+          if (!isAutoGreeting) {
+            const manualText = msgText || '[Archivo/Imagen enviado manualmente desde WhatsApp]';
+            logger.info({ tenantId, remoteJid: rJid, text: manualText }, '👤 Intervención humana manual detectada en Relay. Pausando IA por 30 min y registrando contexto.');
+            await pauseAiForTenantJid(tenantId, rJid, 1800);
+            await logHumanMessage(tenantId, rJid, msg.key.id, manualText);
+          } else {
+            logger.info({ tenantId, remoteJid: rJid, text: msgText }, '🤖 Saludo automático o anuncio detectado en Relay (fromMe). Omitiendo pausa de IA.');
+          }
+        }
+        continue;
+      }
+
+      const relayContextInfo = rawMsg.extendedTextMessage?.contextInfo || rawMsg.contextInfo || {};
+      const relayRef = relayContextInfo.referral || relayContextInfo.externalAdReply;
+      if (relayRef) {
+        const headline = relayRef.headline || relayRef.title || '';
+        const body = relayRef.body || relayRef.snippet || '';
+        const refDetails = [headline, body].filter(Boolean).join(' - ');
+        if (refDetails) {
+          msgText = msgText ? `${msgText}\n[Origen Anuncio Meta/Facebook: ${refDetails}]` : `[Origen Anuncio Meta/Facebook: ${refDetails}]`;
+        }
+      }
 
       if (!msgText && (rawMsg.imageMessage || msg.message?.imageMessage)) {
         msgText = '[El cliente envió una imagen del producto]';
@@ -409,11 +501,20 @@ app.post('/api/relay/webhook', async (req, res) => {
     } catch (e) {}
   }
 
+  let finalText = text || '';
+  const singleRef = req.body.referral || req.body.contextInfo?.referral || req.body.contextInfo?.externalAdReply || req.body.externalAdReply || req.body.ad;
+  const singleHeadline = req.body.adTitle || req.body.headline || singleRef?.headline || singleRef?.title || '';
+  const singleAdBody = req.body.adBody || singleRef?.body || singleRef?.snippet || '';
+  const singleRefDetails = [singleHeadline, singleAdBody].filter(Boolean).join(' - ');
+  if (singleRefDetails && !finalText.includes('[Origen Anuncio Meta/Facebook:')) {
+    finalText = finalText ? `${finalText}\n[Origen Anuncio Meta/Facebook: ${singleRefDetails}]` : `[Origen Anuncio Meta/Facebook: ${singleRefDetails}]`;
+  }
+
   const payload = {
     tenantId,
     senderJid: remoteJid,
     messageId: messageId || `relay-${Date.now()}`,
-    text: text || '',
+    text: finalText,
     mediaBase64: processedMediaBase64,
     mediaMimeType: processedMediaMimeType,
     timestamp: timestamp || new Date().toISOString()

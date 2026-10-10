@@ -317,7 +317,7 @@ export default function App() {
   // Estado del QR y Gateway
   const [qrStatus, setQrStatus] = useState('DISCONNECTED');
   const [qrDataUrl, setQrDataUrl] = useState('');
-  const [connectedPhone, setConnectedPhone] = useState('50588713689');
+  const [connectedPhone, setConnectedPhone] = useState('');
   const [connectionMode, setConnectionMode] = useState('CENTRALIZED');
   const [isChangingMode, setIsChangingMode] = useState(false);
 
@@ -527,15 +527,16 @@ export default function App() {
           setQrStatus('CONNECTED');
           setConnectedPhone(data.phoneNumber || 'Conectado');
           setQrDataUrl('');
-        } else if (data.status === 'RELAY_MODE') {
-          setQrStatus('RELAY_MODE');
-          if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
+        } else if (data.status === 'RELAY_MODE' && data.phoneNumber) {
+          setQrStatus('CONNECTED');
+          setConnectedPhone(data.phoneNumber);
           setQrDataUrl('');
         } else if (data.status === 'QR_READY') {
           setQrStatus('QR_READY');
           setQrDataUrl(data.qrDataUrl);
         } else {
-          setQrStatus('DISCONNECTED');
+          setQrStatus(data.status || 'DISCONNECTED');
+          setConnectedPhone('');
           setQrDataUrl('');
         }
       } catch (e) {}
@@ -1341,16 +1342,22 @@ export default function App() {
         const data = await res.json();
         if (data.connectionMode) setConnectionMode(data.connectionMode);
         
-        if (data.connected) {
+        if (data.connected && data.phoneNumber) {
           setQrStatus('CONNECTED');
-          if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
+          setConnectedPhone(data.phoneNumber);
           setQrDataUrl('');
-        } else if (data.status === 'RELAY_MODE' || data.connectionMode === 'RELAY') {
-          setQrStatus('RELAY_MODE');
-          if (data.phoneNumber) setConnectedPhone(data.phoneNumber);
+        } else if (data.connectionMode === 'RELAY') {
+          if (data.connected && data.phoneNumber) {
+            setQrStatus('CONNECTED');
+            setConnectedPhone(data.phoneNumber);
+          } else {
+            setQrStatus('RELAY_DISCONNECTED');
+            setConnectedPhone('');
+          }
           setQrDataUrl('');
         } else {
           setQrStatus(data.status || 'DISCONNECTED');
+          setConnectedPhone('');
         }
       }
     } catch (e) {}
@@ -2247,7 +2254,7 @@ export default function App() {
                       {isDisconnecting ? 'Desvinculando...' : 'Desvincular Dispositivo'}
                     </button>
                   </div>
-                ) : qrStatus === 'RELAY_MODE' ? (
+                ) : (connectionMode === 'RELAY' && qrStatus === 'CONNECTED' && connectedPhone) ? (
                   <div style={{ background: 'rgba(34, 197, 94, 0.12)', border: '1px solid var(--primary-green)', padding: '24px', borderRadius: '14px' }}>
                     <Smartphone size={52} color="var(--primary-green)" style={{ margin: '0 auto 12px' }} />
                     <h3 style={{ color: 'var(--primary-green)', marginBottom: '6px' }}>¡Vinculación Exitosa en Teléfono del Cliente!</h3>
@@ -2255,6 +2262,17 @@ export default function App() {
                       Modo Relay Móvil Activo (Gestionado directamente desde la aplicación móvil Android).
                     </p>
                     {connectedPhone && <p style={{ fontSize: '0.95rem', color: 'var(--text-main)', marginTop: '6px' }}>Número: <strong>+{connectedPhone}</strong></p>}
+                  </div>
+                ) : connectionMode === 'RELAY' ? (
+                  <div style={{ background: 'rgba(234, 179, 8, 0.12)', border: '1px solid #EAB308', padding: '24px', borderRadius: '14px' }}>
+                    <Smartphone size={52} color="#EAB308" style={{ margin: '0 auto 12px' }} />
+                    <h3 style={{ color: '#CA8A04', marginBottom: '6px' }}>📱 Modo Relay Móvil Activado — Esperando Vinculación</h3>
+                    <p style={{ fontSize: '0.95rem', color: 'var(--text-main)', marginTop: '4px' }}>
+                      La aplicación WebSavvy Relay en el dispositivo Android aún no ha vinculado WhatsApp Business.
+                    </p>
+                    <p style={{ fontSize: '0.88rem', color: 'var(--text-muted)', marginTop: '8px' }}>
+                      Abre la app en el teléfono, ingresa el Tenant ID y escanea el código QR desde WhatsApp Business para conectar.
+                    </p>
                   </div>
                 ) : qrDataUrl ? (
                   <div style={{ background: '#FFFFFF', padding: '16px', borderRadius: '14px', display: 'inline-block' }}>
@@ -3337,11 +3355,11 @@ REGLAS DE AGENDAMIENTO Y HERRAMIENTAS:
                       </td>
                       <td style={{ padding: '12px' }}>
                         <span style={{ 
-                          color: (t.whatsapp_status === 'CONNECTED' || t.connection_mode === 'RELAY') ? '#22C55E' : '#EF4444', 
+                          color: (t.whatsapp_status === 'CONNECTED' && t.phone_number) ? '#22C55E' : '#EF4444', 
                           fontWeight: 'bold' 
                         }}>
                           {t.connection_mode === 'RELAY' 
-                            ? '🟢 Conectado (Relay)' 
+                            ? ((t.whatsapp_status === 'CONNECTED' && t.phone_number) ? '🟢 Conectado (Relay)' : '🔴 Desconectado (Relay)') 
                             : (t.whatsapp_status === 'CONNECTED' ? '🟢 Conectado' : '🔴 Desconectado')}
                         </span>
                       </td>
