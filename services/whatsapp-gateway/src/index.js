@@ -76,6 +76,10 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const activeSockets = new Map();
 // Mapa de Clientes SSE conectados esperando QR por tenantId
 const sseClients = new Map();
+// Cache del último código QR en Base64 por tenantId para entrega inmediata
+const latestQrMap = new Map();
+// Registro de timestamp de conexión de sesión para filtrar ráfagas de sync
+const sessionConnectedAtMap = new Map();
 
 /**
  * Obtiene o crea la ruta local de auth auth_info por tenant
@@ -92,10 +96,18 @@ function getTenantAuthDir(tenantId) {
  * Emite actualización de QR o estado vía Server-Sent Events (SSE)
  */
 function notifySseClients(tenantId, data) {
+  if (data?.status === 'QR_READY' && data.qrDataUrl) {
+    latestQrMap.set(tenantId, data.qrDataUrl);
+  } else if (data?.status === 'CONNECTED' || data?.status === 'DISCONNECTED') {
+    latestQrMap.delete(tenantId);
+  }
+
   if (sseClients.has(tenantId)) {
     const clients = sseClients.get(tenantId);
     clients.forEach(res => {
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      try {
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      } catch (err) {}
     });
   }
 }
@@ -128,10 +140,16 @@ async function startTenantSession(tenantId) {
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['WebSavvy AI', 'Chrome', '1.0.0'],
     
+    // Configuración de red y KeepAlive robusto para prevenir sockets zombies
+    keepAliveIntervalMs: 15000,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    emitOwnEvents: false,
+
     // Configuración E2EE para prevenir "Waiting for this message"
     msgRetryCounterCache,
     retryRequestDelayMs: 250,
@@ -157,6 +175,7 @@ async function startTenantSession(tenantId) {
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { margin: 2, scale: 6 });
+        latestQrMap.set(tenantId, qrDataUrl);
         notifySseClients(tenantId, { status: 'QR_READY', qrDataUrl });
       } catch (err) {
         logger.error({ err }, 'Error generando DataURL del QR');
@@ -169,6 +188,8 @@ async function startTenantSession(tenantId) {
       logger.warn(`Conexión cerrada para tenant ${tenantId}. Código: ${statusCode}. Reconectar: ${shouldReconnect}`);
 
       activeSockets.delete(tenantId);
+      sessionConnectedAtMap.delete(tenantId);
+      latestQrMap.delete(tenantId);
       await updateSessionStatus(tenantId, 'DISCONNECTED');
       notifySseClients(tenantId, { status: 'DISCONNECTED' });
 
@@ -188,6 +209,8 @@ async function startTenantSession(tenantId) {
         }).catch(err => logger.error({ err }, 'Error al intentar enviar correo de desconexión'));
       }
     } else if (connection === 'open') {
+      sessionConnectedAtMap.set(tenantId, Date.now());
+      latestQrMap.delete(tenantId);
       const phoneNumber = sock.user ? sock.user.id.split(':')[0] : 'Conectado';
       logger.info(`✅ WhatsApp Gateway activado para tenant ${tenantId} (+${phoneNumber})`);
       
@@ -248,15 +271,33 @@ async function startTenantSession(tenantId) {
 
       // Captura de Intervención Humana (Mensaje enviado manualmente desde WhatsApp Web / Móvil en tiempo real)
       if (msg.key.fromMe) {
-        // Verificar antigüedad del mensaje para descartar sincronizaciones de historial al abrir WhatsApp Web
+        // 1. Descartar si ocurrió durante la sincronización inicial de reconexión (primeros 20s de la sesión)
+        const connectedAt = sessionConnectedAtMap.get(tenantId) || 0;
+        if (Date.now() - connectedAt < 20000) {
+          logger.info({ tenantId, remoteJid: targetJid }, '📜 Sincronización inicial de conexión detectada (fromMe). Omitiendo pausa de IA.');
+          continue;
+        }
+
+        // 2. Extraer timestamp con alta fidelidad para descartar historial diferido
         const nowSec = Math.floor(Date.now() / 1000);
         const rawTs = msg.messageTimestamp;
-        const msgSec = typeof rawTs === 'number' ? rawTs : (rawTs?.low || rawTs || nowSec);
-        const ageSeconds = nowSec - msgSec;
+        let msgSec = null;
+        if (typeof rawTs === 'number') {
+          msgSec = rawTs;
+        } else if (rawTs && typeof rawTs === 'object') {
+          if (typeof rawTs.toNumber === 'function') {
+            msgSec = rawTs.toNumber();
+          } else if (typeof rawTs.low === 'number') {
+            msgSec = rawTs.unsigned ? rawTs.low >>> 0 : rawTs.low;
+          }
+        }
 
-        if (ageSeconds > 30) {
-          logger.info({ tenantId, remoteJid: targetJid, ageSeconds }, '📜 Mensaje histórico sincronizado desde WhatsApp Web/Móvil. Omitiendo pausa de IA.');
-          continue;
+        if (msgSec !== null) {
+          const ageSeconds = nowSec - msgSec;
+          if (ageSeconds > 25) {
+            logger.info({ tenantId, remoteJid: targetJid, ageSeconds }, '📜 Mensaje histórico sincronizado desde WhatsApp Web/Móvil. Omitiendo pausa de IA.');
+            continue;
+          }
         }
 
         const isBotMessage = await getCachedSentMessage(tenantId, msg.key.id);
@@ -581,20 +622,27 @@ app.post('/api/gateway/disconnect/:tenantId', async (req, res) => {
   const { tenantId } = req.params;
   logger.info(`Llegó petición de desconexión para: ${tenantId}`);
   const sock = activeSockets.get(tenantId);
+  latestQrMap.delete(tenantId);
+  sessionConnectedAtMap.delete(tenantId);
   
   try {
     if (sock) {
-      await sock.logout(); // Esto forzará un DisconnectReason.loggedOut
-      activeSockets.delete(tenantId);
-    } else {
-      // Si el socket no está activo, simplemente limpiamos las credenciales
-      const authDir = getTenantAuthDir(tenantId);
-      if (fs.existsSync(authDir)) {
-        fs.rmSync(authDir, { recursive: true, force: true });
+      try {
+        await sock.logout();
+      } catch (e) {
+        try { sock.end(undefined); } catch (e2) {}
       }
-      await updateSessionStatus(tenantId, 'DISCONNECTED');
-      notifySseClients(tenantId, { status: 'DISCONNECTED' });
+      activeSockets.delete(tenantId);
     }
+    
+    // Limpiamos siempre las credenciales en disco
+    const authDir = getTenantAuthDir(tenantId);
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { recursive: true, force: true });
+    }
+    await updateSessionStatus(tenantId, 'DISCONNECTED');
+    notifySseClients(tenantId, { status: 'DISCONNECTED' });
+
     logger.info(`Desvinculación manual ejecutada para tenant ${tenantId}`);
     res.json({ status: 'success', message: 'WhatsApp desvinculado correctamente' });
   } catch (error) {
@@ -617,21 +665,32 @@ app.get('/api/gateway/qr-stream/:tenantId', async (req, res) => {
   }
   sseClients.get(tenantId).push(res);
 
-  // Si el socket ya está activo y autenticado, emitir inmediatamente el estado CONNECTED
+  // 1. Si el socket ya está activo y autenticado, emitir inmediatamente el estado CONNECTED
   const sock = activeSockets.get(tenantId);
   if (sock && sock.user) {
     const phoneNumber = sock.user.id ? sock.user.id.split(':')[0] : 'Conectado';
     res.write(`data: ${JSON.stringify({ status: 'CONNECTED', phoneNumber })}\n\n`);
+  } else if (latestQrMap.has(tenantId)) {
+    // 2. Si ya hay un QR fresco generado en memoria, emitirlo de inmediato para que el frontend lo dibuje sin esperar
+    res.write(`data: ${JSON.stringify({ status: 'QR_READY', qrDataUrl: latestQrMap.get(tenantId) })}\n\n`);
   } else {
-    // También verificar si en DB ya figura como CONNECTED
+    // 3. Verificar si en DB ya figura como CONNECTED
     const dbStatus = await getSessionStatus(tenantId);
     if (dbStatus && dbStatus.status === 'CONNECTED') {
       res.write(`data: ${JSON.stringify({ status: 'CONNECTED', phoneNumber: dbStatus.phone_number || 'Conectado' })}\n\n`);
+    } else {
+      res.write(`data: ${JSON.stringify({ status: 'CONNECTING' })}\n\n`);
     }
   }
 
-  // Iniciar la sesión Baileys para este tenant si aún no está activa
-  startTenantSession(tenantId);
+  // Si se solicita forzar reconexión o si no hay socket activo, iniciar sesión Baileys
+  if (req.query.reconnect === 'true' && (!sock || !sock.user)) {
+    activeSockets.delete(tenantId);
+    latestQrMap.delete(tenantId);
+    startTenantSession(tenantId);
+  } else if (!activeSockets.has(tenantId)) {
+    startTenantSession(tenantId);
+  }
 
   req.on('close', () => {
     const clients = sseClients.get(tenantId) || [];
@@ -817,6 +876,9 @@ app.post('/api/gateway/send-event-message', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'whatsapp-gateway', activeSocketsCount: activeSockets.size });
+});
+app.get('/api/gateway/health', (req, res) => {
   res.json({ status: 'ok', service: 'whatsapp-gateway', activeSocketsCount: activeSockets.size });
 });
 
